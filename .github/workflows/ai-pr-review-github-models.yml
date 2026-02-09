@@ -16,8 +16,6 @@ on:
           - openai/gpt-4o
           - openai/gpt-4o-mini
           - openai/gpt-4.1
-          - meta/llama-4-scout-17b-16e-instruct
-          - deepseek/deepseek-r1
 
 jobs:
   pr-review:
@@ -36,10 +34,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Get PR details
-          pr_data=$(gh pr view ${{ inputs.pr_number }} --json title,body)
-          echo "title=$(echo $pr_data | jq -r '.title')" >> $GITHUB_OUTPUT
-          echo "body=$(echo $pr_data | jq -r '.body // ""')" >> $GITHUB_OUTPUT
+          # Get PR metadata
+          pr_data=$(gh pr view ${{ inputs.pr_number }} --json title,body,headRefOid)
+          echo "title=$(echo "$pr_data" | jq -r '.title')" >> $GITHUB_OUTPUT
+          echo "body=$(echo "$pr_data" | jq -r '.body // ""')" >> $GITHUB_OUTPUT
+          echo "head_sha=$(echo "$pr_data" | jq -r '.headRefOid')" >> $GITHUB_OUTPUT
 
           # Get PR diff
           gh pr diff ${{ inputs.pr_number }} > pr_diff.txt
@@ -53,90 +52,191 @@ jobs:
             echo "TRUNCATED=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Run AI Review
+      - name: Annotate diff with file paths and line numbers
+        run: |
+          # Transform unified diff into an annotated format so the AI can
+          # reference exact file paths and line numbers for inline comments.
+          # Added lines are tagged as [path:line], removals as [REMOVED].
+          awk '
+          BEGIN { file = ""; nl = 0 }
+          /^diff --git/ {
+            n = split($0, parts, " ")
+            file = parts[n]
+            sub(/^b\//, "", file)
+            next
+          }
+          /^(---|\+\+\+|index |old mode|new mode|similarity|rename|copy|new file|deleted file)/ { next }
+          /^@@/ {
+            # Extract new-file start line from "+N" in the hunk header
+            s = $3
+            sub(/\+/, "", s)
+            sub(/,.*/, "", s)
+            nl = int(s)
+            print ""
+            print "=== " file " ==="
+            next
+          }
+          /^\+/ {
+            printf "[%s:%d] %s\n", file, nl, $0
+            nl++
+            next
+          }
+          /^-/ {
+            printf "[REMOVED] %s\n", $0
+            next
+          }
+          {
+            # Context line — track line number but don't annotate
+            nl++
+          }
+          ' pr_diff.txt > annotated_diff.txt
+
+      - name: Run AI review
         id: review
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Create review prompt
-          cat > review_prompt.txt << 'EOF'
-          You are an experienced code reviewer. Please review this pull request and provide:
+          # --- System prompt: defines the structured output contract ---
+          cat > system_prompt.txt << 'SYSPROMPT'
+          You are an expert code reviewer. You will receive a pull request diff
+          where each added/changed line is annotated as [filepath:line_number].
 
-          1. **Summary**: Brief overview of the changes
-          2. **Strengths**: What's done well
-          3. **Issues**: Bugs, security concerns, or logic errors (if any)
-          4. **Suggestions**: Improvements for code quality, performance, or maintainability
-          5. **Security**: Any security concerns
-          6. **Testing**: Comments on test coverage
+          Return your review as a **single JSON object** with this exact schema:
 
-          Be constructive and specific. Format your response in markdown.
+          {
+            "summary": "<markdown-formatted overall review>",
+            "inline_comments": [
+              {
+                "path": "relative/file/path.ext",
+                "line": <integer — must match a [filepath:line] annotation>,
+                "body": "Your specific, actionable comment"
+              }
+            ]
+          }
 
+          Rules:
+          - "path" and "line" MUST exactly match values from the [filepath:line] annotations.
+          - Only comment on added/changed lines (those with [filepath:line] annotations).
+          - Keep inline comments specific, actionable, and concise.
+          - Focus on: bugs, security issues, performance problems, correctness, and maintainability.
+          - Do NOT add praise-only inline comments — only comment where there is something actionable.
+          - If nothing warrants an inline comment, return an empty "inline_comments" array.
+          - "summary" should cover: overview of changes, strengths, issues, suggestions, security, and testing.
+          - Return ONLY the raw JSON object. No markdown fences. No surrounding text.
+          SYSPROMPT
+
+          # --- User prompt: PR context + annotated diff ---
+          cat > user_prompt.txt << EOF
           PR Title: ${{ steps.pr.outputs.title }}
           PR Description: ${{ steps.pr.outputs.body }}
 
-          Diff:
+          Annotated Diff:
           EOF
+          cat annotated_diff.txt >> user_prompt.txt
 
-          cat pr_diff.txt >> review_prompt.txt
+          # Escape for JSON
+          SYSTEM_JSON=$(jq -Rs . < system_prompt.txt)
+          USER_JSON=$(jq -Rs . < user_prompt.txt)
 
-          # Escape prompt for JSON
-          PROMPT_JSON=$(jq -Rs . < review_prompt.txt)
-
-          # Call GitHub Models API (OpenAI-compatible)
+          # Call GitHub Models API
           response=$(curl -s https://models.github.ai/inference/chat/completions \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -d "{
               \"model\": \"${{ inputs.model }}\",
               \"max_tokens\": 4096,
-              \"messages\": [{
-                \"role\": \"user\",
-                \"content\": $PROMPT_JSON
-              }]
+              \"temperature\": 0.2,
+              \"messages\": [
+                {\"role\": \"system\", \"content\": $SYSTEM_JSON},
+                {\"role\": \"user\",   \"content\": $USER_JSON}
+              ]
             }")
 
-          # Debug: save response
           echo "$response" > api_response.json
 
-          # Extract review text
-          review_text=$(echo "$response" | jq -r '.choices[0].message.content // "Error: No response from API"')
-
-          # Check if we got an error
+          # --- Handle API-level errors ---
           if echo "$response" | jq -e '.error' > /dev/null 2>&1; then
             error_msg=$(echo "$response" | jq -r '.error.message')
-            echo "API Error: $error_msg"
-            echo "# ⚠️ API Error" > review.md
-            echo "" >> review.md
-            echo "Failed to get review from GitHub Models API:" >> review.md
-            echo "\`\`\`" >> review.md
-            echo "$error_msg" >> review.md
-            echo "\`\`\`" >> review.md
+            echo "::error::GitHub Models API error: $error_msg"
+            printf '{"summary":"⚠️ **API Error**\\n\\n%s","inline_comments":[]}' "$error_msg" > review.json
+            exit 0
+          fi
+
+          # --- Extract content and parse JSON ---
+          content=$(echo "$response" | jq -r '.choices[0].message.content // ""')
+
+          # Try direct JSON parse
+          if echo "$content" | jq . > /dev/null 2>&1; then
+            echo "$content" > review.json
           else
-            # Save to file
-            echo "$review_text" > review.md
+            # Strip markdown code fences and retry
+            cleaned=$(echo "$content" | sed '/^```/d')
+            if echo "$cleaned" | jq . > /dev/null 2>&1; then
+              echo "$cleaned" > review.json
+            else
+              # Fallback: use raw content as summary, no inline comments
+              echo "::warning::AI response was not valid JSON — falling back to plain comment"
+              jq -n --arg s "$content" '{"summary": $s, "inline_comments": []}' > review.json
+            fi
           fi
 
-          # Create truncation warning if needed
+          # Append truncation warning if needed
           if [ "${{ steps.pr.outputs.TRUNCATED }}" == "true" ]; then
-            echo -e "\n\n---\n**⚠️ Note**: The diff was truncated due to size. This review covers the first ~50KB of changes." >> review.md
+            jq '.summary += "\n\n---\n**⚠️ Note**: The diff was truncated due to size. This review covers the first ~50KB of changes."' \
+              review.json > tmp.json && mv tmp.json review.json
           fi
 
-          echo "review_file=review.md" >> $GITHUB_OUTPUT
-
-      - name: Post review as comment
+      - name: Post review with inline comments
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cat review.md | gh pr comment ${{ inputs.pr_number }} --body-file -
+          summary=$(jq -r '.summary' review.json)
+          comment_count=$(jq '.inline_comments | length' review.json)
 
-          echo "✅ Review posted to PR #${{ inputs.pr_number }}"
+          if [ "$comment_count" -gt 0 ]; then
+            # Build the PR review payload (inline comments + summary)
+            jq --arg sha "${{ steps.pr.outputs.head_sha }}" '{
+              body: .summary,
+              event: "COMMENT",
+              commit_id: $sha,
+              comments: [.inline_comments[] | {path, line, body, side: "RIGHT"}]
+            }' review.json > review_payload.json
 
-      - name: Upload review artifact
+            echo "Submitting review with $comment_count inline comment(s)..."
+
+            if gh api "repos/${{ github.repository }}/pulls/${{ inputs.pr_number }}/reviews" \
+                 --method POST --input review_payload.json > review_result.json 2>&1; then
+              echo "✅ Review with inline comments posted to PR #${{ inputs.pr_number }}"
+            else
+              # Inline comments failed (likely bad line references) — fall back
+              echo "::warning::Inline comments rejected by GitHub API — posting as regular comment"
+              cat review_result.json
+
+              {
+                echo "$summary"
+                echo ""
+                echo "---"
+                echo "### Inline Comments"
+                echo ""
+                jq -r '.inline_comments[] | "- **`\(.path):\(.line)`** — \(.body)"' review.json
+              } > fallback_comment.md
+
+              gh pr comment ${{ inputs.pr_number }} --body-file fallback_comment.md
+              echo "✅ Review posted as regular comment (fallback) to PR #${{ inputs.pr_number }}"
+            fi
+          else
+            # No inline comments — just post the summary
+            echo "$summary" | gh pr comment ${{ inputs.pr_number }} --body-file -
+            echo "✅ Summary posted to PR #${{ inputs.pr_number }}"
+          fi
+
+      - name: Upload review artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ai-review-gh-models-pr-${{ inputs.pr_number }}
           path: |
-            review.md
+            review.json
             api_response.json
+            annotated_diff.txt
           retention-days: 30
