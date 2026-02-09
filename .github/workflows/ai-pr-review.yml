@@ -27,27 +27,19 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       
-      - name: Fetch PR details
+      - name: Get PR details and diff
         id: pr
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           # Get PR details
-          pr_data=$(gh pr view ${{ inputs.pr_number }} --json title,body,headRefName,baseRefName)
+          pr_data=$(gh pr view ${{ inputs.pr_number }} --json title,body)
           echo "title=$(echo $pr_data | jq -r '.title')" >> $GITHUB_OUTPUT
-          echo "body=$(echo $pr_data | jq -r '.body')" >> $GITHUB_OUTPUT
-          echo "head=$(echo $pr_data | jq -r '.headRefName')" >> $GITHUB_OUTPUT
-          echo "base=$(echo $pr_data | jq -r '.baseRefName')" >> $GITHUB_OUTPUT
-      
-      - name: Get PR diff
-        id: diff
-        run: |
-          git fetch origin ${{ steps.pr.outputs.base }}:${{ steps.pr.outputs.base }}
-          git fetch origin ${{ steps.pr.outputs.head }}:${{ steps.pr.outputs.head }}
-          git diff ${{ steps.pr.outputs.base }}..${{ steps.pr.outputs.head }} > pr_diff.txt
+          echo "body=$(echo $pr_data | jq -r '.body // ""')" >> $GITHUB_OUTPUT
+          
+          # Get PR diff
+          gh pr diff ${{ inputs.pr_number }} > pr_diff.txt
           
           # Truncate if too large (keep first 50000 chars)
           if [ $(wc -c < pr_diff.txt) -gt 50000 ]; then
@@ -105,7 +97,7 @@ jobs:
           echo "$review_text" > review.md
           
           # Create truncation warning if needed
-          if [ "${{ steps.diff.outputs.TRUNCATED }}" == "true" ]; then
+          if [ "${{ steps.pr.outputs.TRUNCATED }}" == "true" ]; then
             echo -e "\n\n---\n**⚠️ Note**: The diff was truncated due to size. This review covers the first ~50KB of changes." >> review.md
           fi
           
