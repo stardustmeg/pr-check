@@ -1,4 +1,4 @@
-name: AI PR Review (OpenAI)
+name: AI PR Review (Anthropic)
 
 on:
   workflow_dispatch:
@@ -8,14 +8,14 @@ on:
         required: true
         type: number
       model:
-        description: 'OpenAI model to use'
+        description: 'AI model to use'
         required: false
-        default: 'gpt-4o'
+        default: 'claude-sonnet-4-20250514'
         type: choice
         options:
-          - gpt-4o
-          - o3-mini
-          - o1
+          - claude-sonnet-4-20250514
+          - claude-opus-4-20250514
+          - claude-haiku-4-20250514
 
 jobs:
   pr-review:
@@ -86,7 +86,7 @@ jobs:
       - name: Run AI review
         id: review
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           cat > system_prompt.txt << 'SYSPROMPT'
           You are an expert code reviewer. You will receive a pull request diff
@@ -127,18 +127,20 @@ jobs:
           SYSTEM_JSON=$(jq -Rs . < system_prompt.txt)
           USER_JSON=$(jq -Rs . < user_prompt.txt)
 
-          # OpenAI API: system prompt as a message in the array
-          response=$(curl -s https://api.openai.com/v1/chat/completions \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $OPENAI_API_KEY" \
+          # Anthropic API: system prompt is a top-level field, not a message
+          response=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "content-type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
             -d "{
               \"model\": \"${{ inputs.model }}\",
-              \"max_completion_tokens\": 4096,
+              \"max_tokens\": 4096,
               \"temperature\": 0.2,
-              \"messages\": [
-                {\"role\": \"system\", \"content\": $SYSTEM_JSON},
-                {\"role\": \"user\",   \"content\": $USER_JSON}
-              ]
+              \"system\": $SYSTEM_JSON,
+              \"messages\": [{
+                \"role\": \"user\",
+                \"content\": $USER_JSON
+              }]
             }")
 
           echo "$response" > api_response.json
@@ -146,13 +148,13 @@ jobs:
           # Handle API errors
           if echo "$response" | jq -e '.error' > /dev/null 2>&1; then
             error_msg=$(echo "$response" | jq -r '.error.message')
-            echo "::error::OpenAI API error: $error_msg"
+            echo "::error::Anthropic API error: $error_msg"
             printf '{"summary":"API Error: %s","inline_comments":[]}' "$error_msg" > review.json
             exit 0
           fi
 
-          # OpenAI response shape: .choices[0].message.content
-          content=$(echo "$response" | jq -r '.choices[0].message.content // ""')
+          # Anthropic response shape: .content[0].text
+          content=$(echo "$response" | jq -r '.content[0].text // ""')
 
           if echo "$content" | jq . > /dev/null 2>&1; then
             echo "$content" > review.json
@@ -216,7 +218,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ai-review-openai-pr-${{ inputs.pr_number }}
+          name: ai-review-anthropic-pr-${{ inputs.pr_number }}
           path: |
             review.json
             api_response.json
