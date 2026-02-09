@@ -54,10 +54,8 @@ jobs:
 
       - name: Annotate diff with file paths and line numbers
         run: |
-          # Transform unified diff into an annotated format so the AI can
-          # reference exact file paths and line numbers for inline comments.
-          # Added lines are tagged as [path:line], removals as [REMOVED].
-          awk '
+          # Write awk script to a file to avoid shell quoting issues
+          cat > annotate_diff.awk << 'AWKEOF'
           BEGIN { file = ""; nl = 0 }
           /^diff --git/ {
             n = split($0, parts, " ")
@@ -67,7 +65,6 @@ jobs:
           }
           /^(---|\+\+\+|index |old mode|new mode|similarity|rename|copy|new file|deleted file)/ { next }
           /^@@/ {
-            # Extract new-file start line from "+N" in the hunk header
             s = $3
             sub(/\+/, "", s)
             sub(/,.*/, "", s)
@@ -86,10 +83,10 @@ jobs:
             next
           }
           {
-            # Context line — track line number but don't annotate
             nl++
           }
-          ' pr_diff.txt > annotated_diff.txt
+          AWKEOF
+          awk -f annotate_diff.awk pr_diff.txt > annotated_diff.txt
 
       - name: Run AI review
         id: review
