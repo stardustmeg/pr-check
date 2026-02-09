@@ -1,4 +1,4 @@
-name: AI PR Review
+name: AI PR Review (OpenAI)
 
 on:
   workflow_dispatch:
@@ -8,14 +8,14 @@ on:
         required: true
         type: number
       model:
-        description: 'AI model to use'
+        description: 'OpenAI model to use'
         required: false
-        default: 'claude-sonnet-4-20250514'
+        default: 'gpt-4o'
         type: choice
         options:
-          - claude-sonnet-4-20250514
-          - claude-opus-4-20250514
-          - claude-haiku-4-20250514
+          - gpt-4o
+          - o3-mini
+          - o1
 
 jobs:
   pr-review:
@@ -53,7 +53,7 @@ jobs:
       - name: Run AI Review
         id: review
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           # Create review prompt
           cat > review_prompt.txt << 'EOF'
@@ -79,14 +79,13 @@ jobs:
           # Escape prompt for JSON
           PROMPT_JSON=$(jq -Rs . < review_prompt.txt)
           
-          # Call Claude API
-          response=$(curl -s https://api.anthropic.com/v1/messages \
-            -H "content-type: application/json" \
-            -H "x-api-key: $ANTHROPIC_API_KEY" \
-            -H "anthropic-version: 2023-06-01" \
+          # Call OpenAI API
+          response=$(curl -s https://api.openai.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
             -d "{
               \"model\": \"${{ inputs.model }}\",
-              \"max_tokens\": 4096,
+              \"max_completion_tokens\": 4096,
               \"messages\": [{
                 \"role\": \"user\",
                 \"content\": $PROMPT_JSON
@@ -97,7 +96,7 @@ jobs:
           echo "$response" > api_response.json
           
           # Extract review text
-          review_text=$(echo "$response" | jq -r '.content[0].text // "Error: No response from API"')
+          review_text=$(echo "$response" | jq -r '.choices[0].message.content // "Error: No response from API"')
           
           # Check if we got an error
           if echo "$response" | jq -e '.error' > /dev/null 2>&1; then
@@ -105,7 +104,7 @@ jobs:
             echo "API Error: $error_msg"
             echo "# ⚠️ API Error" > review.md
             echo "" >> review.md
-            echo "Failed to get review from Claude API:" >> review.md
+            echo "Failed to get review from OpenAI API:" >> review.md
             echo "\`\`\`" >> review.md
             echo "$error_msg" >> review.md
             echo "\`\`\`" >> review.md
@@ -133,7 +132,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ai-review-pr-${{ inputs.pr_number }}
+          name: ai-review-openai-pr-${{ inputs.pr_number }}
           path: |
             review.md
             api_response.json
