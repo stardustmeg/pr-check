@@ -1,0 +1,127 @@
+name: AI PR Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to review'
+        required: true
+        type: number
+      model:
+        description: 'AI model to use'
+        required: false
+        default: 'claude-sonnet-4-20250514'
+        type: choice
+        options:
+          - claude-sonnet-4-20250514
+          - claude-opus-4-20250514
+          - claude-haiku-4-20250514
+
+jobs:
+  pr-review:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Fetch PR details
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Get PR details
+          pr_data=$(gh pr view ${{ inputs.pr_number }} --json title,body,headRefName,baseRefName)
+          echo "title=$(echo $pr_data | jq -r '.title')" >> $GITHUB_OUTPUT
+          echo "body=$(echo $pr_data | jq -r '.body')" >> $GITHUB_OUTPUT
+          echo "head=$(echo $pr_data | jq -r '.headRefName')" >> $GITHUB_OUTPUT
+          echo "base=$(echo $pr_data | jq -r '.baseRefName')" >> $GITHUB_OUTPUT
+      
+      - name: Get PR diff
+        id: diff
+        run: |
+          git fetch origin ${{ steps.pr.outputs.base }}:${{ steps.pr.outputs.base }}
+          git fetch origin ${{ steps.pr.outputs.head }}:${{ steps.pr.outputs.head }}
+          git diff ${{ steps.pr.outputs.base }}..${{ steps.pr.outputs.head }} > pr_diff.txt
+          
+          # Truncate if too large (keep first 50000 chars)
+          if [ $(wc -c < pr_diff.txt) -gt 50000 ]; then
+            head -c 50000 pr_diff.txt > pr_diff_truncated.txt
+            echo "TRUNCATED=true" >> $GITHUB_OUTPUT
+            mv pr_diff_truncated.txt pr_diff.txt
+          else
+            echo "TRUNCATED=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Run AI Review
+        id: review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Create review prompt
+          cat > review_prompt.txt << 'EOF'
+          You are an experienced code reviewer. Please review this pull request and provide:
+
+          1. **Summary**: Brief overview of the changes
+          2. **Strengths**: What's done well
+          3. **Issues**: Bugs, security concerns, or logic errors (if any)
+          4. **Suggestions**: Improvements for code quality, performance, or maintainability
+          5. **Security**: Any security concerns
+          6. **Testing**: Comments on test coverage
+
+          Be constructive and specific. Format your response in markdown.
+
+          PR Title: ${{ steps.pr.outputs.title }}
+          PR Description: ${{ steps.pr.outputs.body }}
+
+          Diff:
+          EOF
+          
+          cat pr_diff.txt >> review_prompt.txt
+          
+          # Call Claude API
+          response=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "content-type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d '{
+              "model": "${{ inputs.model }}",
+              "max_tokens": 4096,
+              "messages": [{
+                "role": "user",
+                "content": "'"$(cat review_prompt.txt | jq -Rs .)"'"
+              }]
+            }')
+          
+          # Extract review text
+          review_text=$(echo "$response" | jq -r '.content[0].text')
+          
+          # Save to file and output
+          echo "$review_text" > review.md
+          
+          # Create truncation warning if needed
+          if [ "${{ steps.diff.outputs.TRUNCATED }}" == "true" ]; then
+            echo -e "\n\n---\n**⚠️ Note**: The diff was truncated due to size. This review covers the first ~50KB of changes." >> review.md
+          fi
+          
+          echo "review_file=review.md" >> $GITHUB_OUTPUT
+      
+      - name: Post review as comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat review.md | gh pr comment ${{ inputs.pr_number }} --body-file -
+          
+          echo "✅ Review posted to PR #${{ inputs.pr_number }}"
+      
+      - name: Upload review artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-pr-${{ inputs.pr_number }}
+          path: review.md
+          retention-days: 30
