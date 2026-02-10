@@ -48,14 +48,19 @@ jobs:
             echo "TRUNCATED=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Annotate diff with file paths and line numbers
+      - name: Annotate diff with file paths, line numbers, and diff positions
         run: |
           cat > annotate_diff.awk << 'AWKEOF'
-          BEGIN { file = ""; nl = 0 }
+          BEGIN {
+            file = ""; nl = 0; pos = 0
+            printf "{" > "position_map.json"
+            first = 1
+          }
           /^diff --git/ {
             n = split($0, parts, " ")
             file = parts[n]
             sub(/^b\//, "", file)
+            pos = 0
             next
           }
           /^(---|\+\+\+|index |old mode|new mode|similarity|rename|copy|new file|deleted file)/ { next }
@@ -69,16 +74,26 @@ jobs:
             next
           }
           /^\+/ {
-            printf "[%s:%d] %s\n", file, nl, $0
+            pos++
+            printf "[%s:%d pos:%d] %s\n", file, nl, pos, $0
+            key = file ":" nl
+            if (!first) printf "," >> "position_map.json"
+            printf "\"%s\":%d", key, pos >> "position_map.json"
+            first = 0
             nl++
             next
           }
           /^-/ {
-            printf "[REMOVED] %s\n", $0
+            pos++
+            printf "[REMOVED pos:%d] %s\n", pos, $0
             next
           }
           {
+            pos++
             nl++
+          }
+          END {
+            printf "}" >> "position_map.json"
           }
           AWKEOF
           awk -f annotate_diff.awk pr_diff.txt > annotated_diff.txt
@@ -90,24 +105,24 @@ jobs:
         run: |
           cat > system_prompt.txt << 'SYSPROMPT'
           You are an expert code reviewer. You will receive a pull request diff
-          where each added/changed line is annotated as [filepath:line_number].
+          where each added/changed line is annotated as [filepath:line_number pos:N].
 
-          Return your review as a **single JSON object** with this exact schema:
+          Return your review as a single JSON object with this exact schema:
 
           {
             "summary": "<markdown-formatted overall review>",
             "inline_comments": [
               {
                 "path": "relative/file/path.ext",
-                "line": <integer - must match a [filepath:line] annotation>,
+                "line": <integer - must match a line_number from annotations>,
                 "body": "Your specific, actionable comment"
               }
             ]
           }
 
           Rules:
-          - "path" and "line" MUST exactly match values from the [filepath:line] annotations.
-          - Only comment on added/changed lines (those with [filepath:line] annotations).
+          - "path" and "line" MUST exactly match values from the [filepath:line_number] annotations.
+          - Only comment on added/changed lines (those with annotations).
           - Keep inline comments specific, actionable, and concise.
           - Focus on: bugs, security issues, performance problems, correctness, and maintainability.
           - Do NOT add praise-only inline comments - only comment where there is something actionable.
@@ -127,8 +142,8 @@ jobs:
           SYSTEM_JSON=$(jq -Rs . < system_prompt.txt)
           USER_JSON=$(jq -Rs . < user_prompt.txt)
 
-          # Anthropic API: system prompt is a top-level field, not a message.
-          # Prefill assistant response with "{" to force JSON output.
+          # Anthropic API: system is a top-level field.
+          # Prefill assistant with "{" to force JSON output.
           response=$(curl -s https://api.anthropic.com/v1/messages \
             -H "content-type: application/json" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
@@ -146,7 +161,6 @@ jobs:
 
           echo "$response" > api_response.json
 
-          # Handle API errors
           if echo "$response" | jq -e '.error' > /dev/null 2>&1; then
             error_msg=$(echo "$response" | jq -r '.error.message')
             echo "::error::Anthropic API error: $error_msg"
@@ -154,18 +168,20 @@ jobs:
             exit 0
           fi
 
-          # Anthropic response shape: .content[0].text
-          content=$(echo "$response" | jq -r '.content[0].text // ""')
+          # Anthropic response: .content[0].text
+          # Prefill means response starts AFTER the "{", so prepend it
+          raw_text=$(echo "$response" | jq -r '.content[0].text // ""')
+          echo "{$raw_text" > content_raw.txt
 
-          if echo "$content" | jq . > /dev/null 2>&1; then
-            echo "$content" > review.json
+          if jq . content_raw.txt > /dev/null 2>&1; then
+            cp content_raw.txt review.json
           else
-            cleaned=$(echo "$content" | sed '/^```/d')
-            if echo "$cleaned" | jq . > /dev/null 2>&1; then
-              echo "$cleaned" > review.json
+            sed '/^```/d' content_raw.txt > content_cleaned.txt
+            if jq . content_cleaned.txt > /dev/null 2>&1; then
+              cp content_cleaned.txt review.json
             else
               echo "::warning::AI response was not valid JSON - falling back to plain comment"
-              jq -n --arg s "$content" '{"summary": $s, "inline_comments": []}' > review.json
+              jq -n --arg s "$(cat content_raw.txt)" '{"summary": $s, "inline_comments": []}' > review.json
             fi
           fi
 
@@ -178,40 +194,57 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          summary=$(jq -r '.summary' review.json)
           comment_count=$(jq '.inline_comments | length' review.json)
 
           if [ "$comment_count" -gt 0 ]; then
-            jq --arg sha "${{ steps.pr.outputs.head_sha }}" '{
+            jq --arg sha "${{ steps.pr.outputs.head_sha }}" \
+               --slurpfile pmap position_map.json \
+            '{
               body: .summary,
               event: "COMMENT",
               commit_id: $sha,
-              comments: [.inline_comments[] | {path, line, body, side: "RIGHT"}]
+              comments: [
+                .inline_comments[] |
+                . as $c |
+                ($c.path + ":" + ($c.line | tostring)) as $key |
+                if $pmap[0][$key] then
+                  { path: $c.path, position: $pmap[0][$key], body: $c.body }
+                else
+                  empty
+                end
+              ]
             }' review.json > review_payload.json
 
-            echo "Submitting review with $comment_count inline comment(s)..."
+            actual_count=$(jq '.comments | length' review_payload.json)
 
-            if gh api "repos/${{ github.repository }}/pulls/${{ inputs.pr_number }}/reviews" \
-                 --method POST --input review_payload.json > review_result.json 2>&1; then
-              echo "Review with inline comments posted to PR #${{ inputs.pr_number }}"
+            if [ "$actual_count" -gt 0 ]; then
+              echo "Submitting review with $actual_count inline comment(s)..."
+
+              if gh api "repos/${{ github.repository }}/pulls/${{ inputs.pr_number }}/reviews" \
+                   --method POST --input review_payload.json > review_result.json 2>&1; then
+                echo "Review with inline comments posted to PR #${{ inputs.pr_number }}"
+              else
+                echo "::warning::Review API rejected comments"
+                cat review_result.json
+
+                summary=$(jq -r '.summary' review.json)
+                {
+                  echo "$summary"
+                  echo ""
+                  echo "---"
+                  echo "### Inline Comments"
+                  echo ""
+                  jq -r '.inline_comments[] | "- **`\(.path):\(.line)`** - \(.body)"' review.json
+                } > fallback_comment.md
+                gh pr comment ${{ inputs.pr_number }} --body-file fallback_comment.md
+                echo "Review posted as regular comment (fallback) to PR #${{ inputs.pr_number }}"
+              fi
             else
-              echo "::warning::Inline comments rejected by GitHub API - posting as regular comment"
-              cat review_result.json
-
-              {
-                echo "$summary"
-                echo ""
-                echo "---"
-                echo "### Inline Comments"
-                echo ""
-                jq -r '.inline_comments[] | "- **`\(.path):\(.line)`** - \(.body)"' review.json
-              } > fallback_comment.md
-
-              gh pr comment ${{ inputs.pr_number }} --body-file fallback_comment.md
-              echo "Review posted as regular comment (fallback) to PR #${{ inputs.pr_number }}"
+              jq -r '.summary' review.json | gh pr comment ${{ inputs.pr_number }} --body-file -
+              echo "Summary posted to PR #${{ inputs.pr_number }}"
             fi
           else
-            echo "$summary" | gh pr comment ${{ inputs.pr_number }} --body-file -
+            jq -r '.summary' review.json | gh pr comment ${{ inputs.pr_number }} --body-file -
             echo "Summary posted to PR #${{ inputs.pr_number }}"
           fi
 
@@ -224,4 +257,5 @@ jobs:
             review.json
             api_response.json
             annotated_diff.txt
+            position_map.json
           retention-days: 30
