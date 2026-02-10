@@ -130,6 +130,7 @@ jobs:
           USER_JSON=$(jq -Rs . < user_prompt.txt)
 
           # OpenAI API: system prompt as a message in the array
+          # response_format forces JSON output at the API level
           response=$(curl -s https://api.openai.com/v1/chat/completions \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
@@ -137,6 +138,7 @@ jobs:
               \"model\": \"${{ inputs.model }}\",
               \"max_completion_tokens\": 4096,
               \"temperature\": 0.2,
+              \"response_format\": {\"type\": \"json_object\"},
               \"messages\": [
                 {\"role\": \"system\", \"content\": $SYSTEM_JSON},
                 {\"role\": \"user\",   \"content\": $USER_JSON}

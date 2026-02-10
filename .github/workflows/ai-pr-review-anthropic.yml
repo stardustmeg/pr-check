@@ -127,7 +127,8 @@ jobs:
           SYSTEM_JSON=$(jq -Rs . < system_prompt.txt)
           USER_JSON=$(jq -Rs . < user_prompt.txt)
 
-          # Anthropic API: system prompt is a top-level field, not a message
+          # Anthropic API: system prompt is a top-level field, not a message.
+          # Prefill assistant response with "{" to force JSON output.
           response=$(curl -s https://api.anthropic.com/v1/messages \
             -H "content-type: application/json" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
@@ -137,10 +138,10 @@ jobs:
               \"max_tokens\": 4096,
               \"temperature\": 0.2,
               \"system\": $SYSTEM_JSON,
-              \"messages\": [{
-                \"role\": \"user\",
-                \"content\": $USER_JSON
-              }]
+              \"messages\": [
+                {\"role\": \"user\", \"content\": $USER_JSON},
+                {\"role\": \"assistant\", \"content\": \"{\"}
+              ]
             }")
 
           echo "$response" > api_response.json

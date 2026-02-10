@@ -135,7 +135,8 @@ jobs:
           SYSTEM_JSON=$(jq -Rs . < system_prompt.txt)
           USER_JSON=$(jq -Rs . < user_prompt.txt)
 
-          # Call GitHub Models API
+          # Call GitHub Models API (OpenAI-compatible)
+          # response_format forces JSON output at the API level
           response=$(curl -s https://models.github.ai/inference/chat/completions \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
@@ -143,6 +144,7 @@ jobs:
               \"model\": \"${{ inputs.model }}\",
               \"max_tokens\": 4096,
               \"temperature\": 0.2,
+              \"response_format\": {\"type\": \"json_object\"},
               \"messages\": [
                 {\"role\": \"system\", \"content\": $SYSTEM_JSON},
                 {\"role\": \"user\",   \"content\": $USER_JSON}
