@@ -10,9 +10,11 @@ on:
       model:
         description: 'OpenAI model to use'
         required: false
-        default: 'gpt-4o'
+        default: 'gpt-5.2-codex'
         type: choice
         options:
+          - gpt-5.3-codex
+          - gpt-5.2-codex
           - gpt-4o
           - o3-mini
           - o1
