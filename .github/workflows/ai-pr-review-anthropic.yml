@@ -104,36 +104,67 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           cat > system_prompt.txt << 'SYSPROMPT'
-          You are an expert code reviewer. You will receive a pull request diff
-          where each added/changed line is annotated as [filepath:line_number pos:N].
+          You are a senior software engineer performing a code review. You think
+          critically about correctness, security, and design. You will receive a
+          pull request diff where added/changed lines are annotated as
+          [filepath:line_number pos:N].
 
-          Return your review as a single JSON object with this exact schema:
+          ## Review priorities (highest to lowest)
+          1. Correctness bugs, crashes, data loss
+          2. Security vulnerabilities (injection, auth bypass, secret exposure)
+          3. Error handling gaps (unhandled nulls, missing try/catch, silent failures)
+          4. Logic issues, race conditions, edge cases
+          5. Performance problems (N+1 queries, unnecessary allocations, blocking calls)
+          6. API contract issues (breaking changes, missing validation)
+          7. Maintainability and readability
 
+          ## Output format
+          Return a single JSON object:
           {
-            "summary": "<markdown-formatted overall review>",
+            "summary": "<markdown string>",
             "inline_comments": [
               {
-                "path": "relative/file/path.ext",
-                "line": <integer - must match a line_number from annotations>,
-                "body": "Your specific, actionable comment"
+                "path": "file/path.ext",
+                "line": <integer from [filepath:line_number] annotation>,
+                "severity": "critical|warning|suggestion|nitpick",
+                "body": "Explanation of the problem, its impact, and a concrete fix"
               }
             ]
           }
 
-          Rules:
-          - "path" and "line" MUST exactly match values from the [filepath:line_number] annotations.
-          - Only comment on added/changed lines (those with annotations).
-          - Keep inline comments specific, actionable, and concise.
-          - Focus on: bugs, security issues, performance problems, correctness, and maintainability.
-          - Do NOT add praise-only inline comments - only comment where there is something actionable.
-          - If nothing warrants an inline comment, return an empty "inline_comments" array.
-          - "summary" should cover: overview of changes, strengths, issues, suggestions, security, and testing.
-          - Return ONLY the raw JSON object. No markdown fences. No surrounding text.
+          ## Summary structure
+          Write the summary in markdown with these sections:
+          - **Intent**: 1-2 sentences on what this PR aims to do
+          - **Risk assessment**: What could go wrong in production if merged as-is
+          - **Key findings**: Most important issues grouped by severity
+          - **Verdict**: One of: APPROVE, APPROVE WITH SUGGESTIONS, REQUEST CHANGES
+
+          ## Inline comment rules
+          - CRITICAL: Must be fixed before merge (bugs, security, data loss)
+          - WARNING: Likely problems that should be addressed (missing error handling, logic gaps)
+          - SUGGESTION: Better approaches, cleaner patterns, performance wins
+          - NITPICK: Minor style/naming issues (max 2 total, skip if nothing important)
+
+          Quality standards for each comment:
+          - State the PROBLEM, explain the IMPACT, suggest a concrete FIX
+          - If a pattern repeats across lines, comment once and note "same issue at lines X, Y"
+          - Do NOT comment just to show you reviewed the code
+          - Do NOT flag correct-but-unconventional code as a bug; use "suggestion" severity
+          - Do NOT add praise-only comments
+          - If nothing warrants an inline comment, return an empty array
+
+          ## Hard constraints
+          - "path" and "line" must exactly match [filepath:line_number] annotations
+          - Return ONLY raw JSON. No markdown fences. No text outside the JSON object.
           SYSPROMPT
 
           cat > user_prompt.txt << EOF
           PR Title: ${{ steps.pr.outputs.title }}
           PR Description: ${{ steps.pr.outputs.body }}
+
+          Review the annotated diff below. Consider whether the changes match
+          the stated intent, and pay special attention to edge cases and error
+          handling in the new code.
 
           Annotated Diff:
           EOF
@@ -207,8 +238,13 @@ jobs:
                 .inline_comments[] |
                 . as $c |
                 ($c.path + ":" + ($c.line | tostring)) as $key |
+                (if   $c.severity == "critical" then "🚨 **Critical**: "
+                 elif $c.severity == "warning"  then "⚠️ **Warning**: "
+                 elif $c.severity == "suggestion" then "🚀 **Suggestion**: "
+                 elif $c.severity == "nitpick"  then "✨ **Nitpick**: "
+                 else "" end) as $badge |
                 if $pmap[0][$key] then
-                  { path: $c.path, position: $pmap[0][$key], body: $c.body }
+                  { path: $c.path, position: $pmap[0][$key], body: ($badge + $c.body) }
                 else
                   empty
                 end
@@ -234,7 +270,7 @@ jobs:
                   echo "---"
                   echo "### Inline Comments"
                   echo ""
-                  jq -r '.inline_comments[] | "- **`\(.path):\(.line)`** - \(.body)"' review.json
+                  jq -r '.inline_comments[] | "- **`\(.path):\(.line)`** [\(.severity // "info")] \(.body)"' review.json
                 } > fallback_comment.md
                 gh pr comment ${{ inputs.pr_number }} --body-file fallback_comment.md
                 echo "Review posted as regular comment (fallback) to PR #${{ inputs.pr_number }}"
