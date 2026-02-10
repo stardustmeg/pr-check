@@ -16,6 +16,14 @@ on:
           - claude-sonnet-4-20250514
           - claude-opus-4-20250514
           - claude-haiku-4-20250514
+      language:
+        description: 'Review language'
+        required: false
+        default: 'English'
+        type: choice
+        options:
+          - English
+          - Russian
 
 jobs:
   pr-review:
@@ -156,7 +164,11 @@ jobs:
           ## Hard constraints
           - "path" and "line" must exactly match [filepath:line_number] annotations
           - Return ONLY raw JSON. No markdown fences. No text outside the JSON object.
+          - Write ALL review text (summary and inline comment bodies) in **$REVIEW_LANG**.
+            JSON keys ("summary", "inline_comments", "path", "line", "severity", "body")
+            must remain in English. Only the human-readable text values change language.
           SYSPROMPT
+          sed -i "s|\$REVIEW_LANG|${{ inputs.language }}|g" system_prompt.txt
 
           cat > user_prompt.txt << EOF
           PR Title: ${{ steps.pr.outputs.title }}
