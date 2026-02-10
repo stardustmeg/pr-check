@@ -10,12 +10,13 @@ on:
       model:
         description: 'Model to use (from GitHub Models marketplace)'
         required: false
-        default: 'openai/gpt-4o'
+        default: 'openai/gpt-5.2'
         type: choice
         options:
+          - openai/gpt-5.2
+          - openai/gpt-4.1
           - openai/gpt-4o
           - openai/gpt-4o-mini
-          - openai/gpt-4.1
 
 jobs:
   pr-review:

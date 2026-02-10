@@ -10,7 +10,7 @@ on:
       model:
         description: 'OpenAI model to use'
         required: false
-        default: 'gpt-4.1'
+        default: 'gpt-5.2'
         type: choice
         options:
           - gpt-5.2
