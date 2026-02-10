@@ -10,7 +10,7 @@ on:
       model:
         description: 'OpenAI model to use'
         required: false
-        default: 'gpt-5.2'
+        default: 'gpt-4.1'
         type: choice
         options:
           - gpt-5.2
@@ -50,14 +50,25 @@ jobs:
             echo "TRUNCATED=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Annotate diff with file paths and line numbers
+      - name: Annotate diff with file paths, line numbers, and diff positions
         run: |
+          # This awk script produces two outputs:
+          # 1. annotated_diff.txt  - for the AI to read (human-friendly)
+          # 2. position_map.json   - maps "file:line" -> diff position for the GitHub API
+          #
+          # GitHub's Reviews API uses "position" (1-based offset from the @@ header,
+          # continuing across hunks per file). The "line"/"side" params are unreliable.
           cat > annotate_diff.awk << 'AWKEOF'
-          BEGIN { file = ""; nl = 0 }
+          BEGIN {
+            file = ""; nl = 0; pos = 0
+            printf "{" > "position_map.json"
+            first = 1
+          }
           /^diff --git/ {
             n = split($0, parts, " ")
             file = parts[n]
             sub(/^b\//, "", file)
+            pos = 0
             next
           }
           /^(---|\+\+\+|index |old mode|new mode|similarity|rename|copy|new file|deleted file)/ { next }
@@ -71,35 +82,44 @@ jobs:
             next
           }
           /^\+/ {
-            printf "[%s:%d] %s\n", file, nl, $0
+            pos++
+            printf "[%s:%d pos:%d] %s\n", file, nl, pos, $0
+            # Write to position map
+            key = file ":" nl
+            if (!first) printf "," >> "position_map.json"
+            printf "\"%s\":%d", key, pos >> "position_map.json"
+            first = 0
             nl++
             next
           }
           /^-/ {
-            printf "[REMOVED] %s\n", $0
+            pos++
+            printf "[REMOVED pos:%d] %s\n", pos, $0
             next
           }
           {
+            # Context line
+            pos++
             nl++
+          }
+          END {
+            printf "}" >> "position_map.json"
           }
           AWKEOF
           awk -f annotate_diff.awk pr_diff.txt > annotated_diff.txt
+
+          echo "::group::Debug - position_map.json"
+          cat position_map.json | jq .
+          echo "::endgroup::"
 
       - name: Run AI review
         id: review
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          PR_TITLE: ${{ steps.pr.outputs.title }}
-          PR_BODY: ${{ steps.pr.outputs.body }}
-          MODEL: ${{ inputs.model }}
-          TRUNCATED: ${{ steps.pr.outputs.TRUNCATED }}
         run: |
-          node << 'NODESCRIPT'
-          const fs = require("fs");
-          const https = require("https");
-
-          const SYSTEM_PROMPT = `You are an expert code reviewer. You will receive a pull request diff
-          where each added/changed line is annotated as [filepath:line_number].
+          cat > system_prompt.txt << 'SYSPROMPT'
+          You are an expert code reviewer. You will receive a pull request diff
+          where each added/changed line is annotated as [filepath:line_number pos:N].
 
           Return your review as a single JSON object with this exact schema:
 
@@ -108,162 +128,152 @@ jobs:
             "inline_comments": [
               {
                 "path": "relative/file/path.ext",
-                "line": 0,
+                "line": <integer - must match a line_number from annotations>,
                 "body": "Your specific, actionable comment"
               }
             ]
           }
 
           Rules:
-          - "path" and "line" MUST exactly match values from the [filepath:line] annotations.
-          - Only comment on added/changed lines (those with [filepath:line] annotations).
+          - "path" and "line" MUST exactly match values from the [filepath:line_number] annotations.
+          - Only comment on added/changed lines (those with annotations).
           - Keep inline comments specific, actionable, and concise.
           - Focus on: bugs, security issues, performance problems, correctness, and maintainability.
           - Do NOT add praise-only inline comments - only comment where there is something actionable.
           - If nothing warrants an inline comment, return an empty "inline_comments" array.
           - "summary" should cover: overview of changes, strengths, issues, suggestions, security, and testing.
-          - Return ONLY the raw JSON object. No markdown fences. No surrounding text.`;
+          - Return ONLY the raw JSON object. No markdown fences. No surrounding text.
+          SYSPROMPT
 
-          const annotatedDiff = fs.readFileSync("annotated_diff.txt", "utf8");
-
-          const userPrompt = `PR Title: ${process.env.PR_TITLE || ""}
-          PR Description: ${process.env.PR_BODY || ""}
+          cat > user_prompt.txt << EOF
+          PR Title: ${{ steps.pr.outputs.title }}
+          PR Description: ${{ steps.pr.outputs.body }}
 
           Annotated Diff:
-          ${annotatedDiff}`;
+          EOF
+          cat annotated_diff.txt >> user_prompt.txt
 
-          const requestBody = JSON.stringify({
-            model: process.env.MODEL,
-            max_completion_tokens: 4096,
-            temperature: 0.2,
-            response_format: { type: "json_object" },
-            messages: [
-              { role: "system", content: SYSTEM_PROMPT },
-              { role: "user", content: userPrompt },
-            ],
-          });
+          SYSTEM_JSON=$(jq -Rs . < system_prompt.txt)
+          USER_JSON=$(jq -Rs . < user_prompt.txt)
 
-          const options = {
-            hostname: "api.openai.com",
-            path: "/v1/chat/completions",
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-              "Content-Length": Buffer.byteLength(requestBody),
-            },
-          };
+          response=$(curl -s https://api.openai.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -d "{
+              \"model\": \"${{ inputs.model }}\",
+              \"max_completion_tokens\": 4096,
+              \"temperature\": 0.2,
+              \"response_format\": {\"type\": \"json_object\"},
+              \"messages\": [
+                {\"role\": \"system\", \"content\": $SYSTEM_JSON},
+                {\"role\": \"user\",   \"content\": $USER_JSON}
+              ]
+            }")
 
-          const req = https.request(options, (res) => {
-            let data = "";
-            res.on("data", (chunk) => (data += chunk));
-            res.on("end", () => {
-              fs.writeFileSync("api_response.json", data);
+          echo "$response" > api_response.json
 
-              let resp;
-              try {
-                resp = JSON.parse(data);
-              } catch (e) {
-                console.log("::error::Failed to parse API response as JSON");
-                fs.writeFileSync("review.json", JSON.stringify({ summary: "Failed to parse API response", inline_comments: [] }));
-                return;
-              }
+          if echo "$response" | jq -e '.error' > /dev/null 2>&1; then
+            error_msg=$(echo "$response" | jq -r '.error.message')
+            echo "::error::OpenAI API error: $error_msg"
+            printf '{"summary":"API Error: %s","inline_comments":[]}' "$error_msg" > review.json
+            exit 0
+          fi
 
-              if (resp.error) {
-                console.log(`::error::OpenAI API error: ${resp.error.message}`);
-                fs.writeFileSync("review.json", JSON.stringify({ summary: `API Error: ${resp.error.message}`, inline_comments: [] }));
-                return;
-              }
+          echo "$response" | jq -r '.choices[0].message.content // ""' > content_raw.txt
 
-              const content = resp.choices?.[0]?.message?.content || "";
+          echo "::group::Debug - Raw AI content (first 500 chars)"
+          head -c 500 content_raw.txt
+          echo ""
+          echo "::endgroup::"
 
-              console.log("::group::Debug - Raw AI content");
-              console.log(content);
-              console.log("::endgroup::");
+          if jq . content_raw.txt > /dev/null 2>&1; then
+            cp content_raw.txt review.json
+          else
+            sed '/^```/d' content_raw.txt > content_cleaned.txt
+            if jq . content_cleaned.txt > /dev/null 2>&1; then
+              cp content_cleaned.txt review.json
+            else
+              echo "::warning::AI response was not valid JSON - falling back to plain comment"
+              jq -n --arg s "$(cat content_raw.txt)" '{"summary": $s, "inline_comments": []}' > review.json
+            fi
+          fi
 
-              let review;
-              try {
-                review = JSON.parse(content);
-              } catch (e) {
-                // Try stripping code fences
-                const cleaned = content.replace(/^```[\w]*\n?/gm, "").replace(/```$/gm, "");
-                try {
-                  review = JSON.parse(cleaned);
-                } catch (e2) {
-                  console.log("::warning::AI response was not valid JSON - falling back to plain comment");
-                  review = { summary: content, inline_comments: [] };
-                }
-              }
+          if [ "${{ steps.pr.outputs.TRUNCATED }}" == "true" ]; then
+            jq '.summary += "\n\n---\n**Note**: The diff was truncated due to size. This review covers the first ~50KB of changes."' \
+              review.json > tmp.json && mv tmp.json review.json
+          fi
 
-              // Append truncation warning
-              if (process.env.TRUNCATED === "true") {
-                review.summary += "\n\n---\n**Note**: The diff was truncated due to size. This review covers the first ~50KB of changes.";
-              }
-
-              console.log("::group::Debug - review.json");
-              console.log(JSON.stringify(review, null, 2));
-              console.log("::endgroup::");
-              console.log(`::notice::Inline comments found: ${(review.inline_comments || []).length}`);
-
-              fs.writeFileSync("review.json", JSON.stringify(review));
-            });
-          });
-
-          req.on("error", (e) => {
-            console.log(`::error::Request failed: ${e.message}`);
-            fs.writeFileSync("review.json", JSON.stringify({ summary: `Request failed: ${e.message}`, inline_comments: [] }));
-          });
-
-          req.write(requestBody);
-          req.end();
-          NODESCRIPT
+          echo "::group::Debug - review.json structure"
+          jq '{summary_length: (.summary | length), inline_comment_count: (.inline_comments | length), comments: [.inline_comments[] | {path, line}]}' review.json
+          echo "::endgroup::"
 
       - name: Post review with inline comments
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          summary=$(jq -r '.summary' review.json)
           comment_count=$(jq '.inline_comments | length' review.json)
-
-          echo "::notice::comment_count=$comment_count, head_sha=${{ steps.pr.outputs.head_sha }}"
+          echo "::notice::comment_count=$comment_count"
 
           if [ "$comment_count" -gt 0 ]; then
-            jq --arg sha "${{ steps.pr.outputs.head_sha }}" '{
+            # Convert AI's file line numbers to diff positions using position_map.json
+            # The GitHub Reviews API reliably resolves "position" but not "line"/"side"
+            jq --arg sha "${{ steps.pr.outputs.head_sha }}" \
+               --slurpfile pmap position_map.json \
+            '{
               body: .summary,
               event: "COMMENT",
               commit_id: $sha,
-              comments: [.inline_comments[] | {path, line, body, side: "RIGHT"}]
+              comments: [
+                .inline_comments[] |
+                . as $c |
+                ($c.path + ":" + ($c.line | tostring)) as $key |
+                if $pmap[0][$key] then
+                  { path: $c.path, position: $pmap[0][$key], body: $c.body }
+                else
+                  empty
+                end
+              ]
             }' review.json > review_payload.json
+
+            actual_count=$(jq '.comments | length' review_payload.json)
+            echo "::notice::Comments after position mapping: $actual_count (dropped $(( comment_count - actual_count )) unresolvable)"
 
             echo "::group::Debug - review_payload.json"
             jq . review_payload.json
             echo "::endgroup::"
 
-            echo "Submitting review with $comment_count inline comment(s)..."
+            if [ "$actual_count" -gt 0 ]; then
+              echo "Submitting review with $actual_count inline comment(s)..."
 
-            if gh api "repos/${{ github.repository }}/pulls/${{ inputs.pr_number }}/reviews" \
-                 --method POST --input review_payload.json > review_result.json 2>&1; then
-              echo "Review with inline comments posted to PR #${{ inputs.pr_number }}"
+              if gh api "repos/${{ github.repository }}/pulls/${{ inputs.pr_number }}/reviews" \
+                   --method POST --input review_payload.json > review_result.json 2>&1; then
+                echo "Review with inline comments posted to PR #${{ inputs.pr_number }}"
+              else
+                echo "::warning::Review API rejected comments"
+                echo "::group::Debug - API rejection"
+                cat review_result.json
+                echo "::endgroup::"
+
+                # Fallback to regular comment
+                summary=$(jq -r '.summary' review.json)
+                {
+                  echo "$summary"
+                  echo ""
+                  echo "---"
+                  echo "### Inline Comments"
+                  echo ""
+                  jq -r '.inline_comments[] | "- **`\(.path):\(.line)`** - \(.body)"' review.json
+                } > fallback_comment.md
+                gh pr comment ${{ inputs.pr_number }} --body-file fallback_comment.md
+                echo "Review posted as regular comment (fallback) to PR #${{ inputs.pr_number }}"
+              fi
             else
-              echo "::warning::Inline comments rejected by GitHub API - posting as regular comment"
-              echo "::group::Debug - API rejection"
-              cat review_result.json
-              echo "::endgroup::"
-
-              {
-                echo "$summary"
-                echo ""
-                echo "---"
-                echo "### Inline Comments"
-                echo ""
-                jq -r '.inline_comments[] | "- **`\(.path):\(.line)`** - \(.body)"' review.json
-              } > fallback_comment.md
-
-              gh pr comment ${{ inputs.pr_number }} --body-file fallback_comment.md
-              echo "Review posted as regular comment (fallback) to PR #${{ inputs.pr_number }}"
+              echo "::warning::No comments survived position mapping - posting summary only"
+              jq -r '.summary' review.json | gh pr comment ${{ inputs.pr_number }} --body-file -
+              echo "Summary posted to PR #${{ inputs.pr_number }}"
             fi
           else
-            echo "$summary" | gh pr comment ${{ inputs.pr_number }} --body-file -
+            jq -r '.summary' review.json | gh pr comment ${{ inputs.pr_number }} --body-file -
             echo "Summary posted to PR #${{ inputs.pr_number }}"
           fi
 
@@ -276,4 +286,7 @@ jobs:
             review.json
             api_response.json
             annotated_diff.txt
+            content_raw.txt
+            position_map.json
+            review_payload.json
           retention-days: 30
