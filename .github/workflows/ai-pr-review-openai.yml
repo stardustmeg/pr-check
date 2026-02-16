@@ -16,16 +16,14 @@ on:
           - gpt-5.2
           - gpt-5-mini
           - gpt-4.1
-          - o4-mini
-          - o3
       language:
         description: 'Review language'
         required: false
-        default: 'English'
+        default: 'Russian'
         type: choice
         options:
-          - English
           - Russian
+          - English
 
 jobs:
   pr-review:
@@ -45,8 +43,14 @@ jobs:
         run: |
           pr_data=$(gh pr view ${{ inputs.pr_number }} --json title,body,headRefOid)
           echo "title=$(echo "$pr_data" | jq -r '.title')" >> $GITHUB_OUTPUT
-          echo "body=$(echo "$pr_data" | jq -r '.body // ""')" >> $GITHUB_OUTPUT
           echo "head_sha=$(echo "$pr_data" | jq -r '.headRefOid')" >> $GITHUB_OUTPUT
+
+          # body can contain newlines — must use heredoc delimiter for GITHUB_OUTPUT
+          {
+            echo "body<<BODY_EOF"
+            echo "$pr_data" | jq -r '.body // ""'
+            echo "BODY_EOF"
+          } >> $GITHUB_OUTPUT
 
           gh pr diff ${{ inputs.pr_number }} > pr_diff.txt
 
