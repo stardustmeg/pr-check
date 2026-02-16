@@ -135,6 +135,14 @@ jobs:
           pull request diff where added/changed lines are annotated as
           [filepath:line_number pos:N].
 
+          ## Project context
+          This is a frontend application with its own backend under the same team's
+          control. When the frontend adds or changes fields, assume the backend has
+          already been updated to provide them correctly. Do NOT flag hypothetical
+          backend incompatibilities, missing fields from API responses, or data
+          migration concerns — those are handled before the frontend PR is opened.
+          Focus your review on frontend logic, UI correctness, and code quality.
+
           ## Review priorities (highest to lowest)
           1. Correctness bugs, crashes, data loss
           2. Security vulnerabilities (injection, auth bypass, secret exposure)
@@ -160,10 +168,13 @@ jobs:
 
           ## Summary structure
           Write the summary in markdown with these sections:
-          - **Intent**: 1-2 sentences on what this PR aims to do
-          - **Risk assessment**: What could go wrong in production if merged as-is
-          - **Key findings**: Most important issues grouped by severity
-          - **Verdict**: One of: APPROVE, APPROVE WITH SUGGESTIONS, REQUEST CHANGES
+          - **$HEADING_INTENT**: 1-2 sentences on what this PR aims to do
+          - **$HEADING_RISK**: What could go wrong in production if merged as-is
+          - **$HEADING_FINDINGS**: Most important issues grouped by severity
+          - **$HEADING_VERDICT**: One of: APPROVE, APPROVE WITH SUGGESTIONS, REQUEST CHANGES
+
+          When grouping issues by severity in the summary, use these display labels:
+          $SEVERITY_CRITICAL, $SEVERITY_WARNING, $SEVERITY_SUGGESTION, $SEVERITY_NITPICK
 
           ## Inline comment rules
           - CRITICAL: Must be fixed before merge (bugs, security, data loss)
@@ -172,7 +183,7 @@ jobs:
           - NITPICK: Minor style/naming issues (max 2 total, skip if nothing important)
 
           Quality standards for each comment:
-          - State the PROBLEM, explain the IMPACT, suggest a concrete FIX
+          - State the $LABEL_PROBLEM, explain the $LABEL_IMPACT, suggest a concrete $LABEL_FIX
           - If a pattern repeats across lines, comment once and note "same issue at lines X, Y"
           - Do NOT comment just to show you reviewed the code
           - Do NOT flag correct-but-unconventional code as a bug; use "suggestion" severity
@@ -186,7 +197,34 @@ jobs:
             JSON keys ("summary", "inline_comments", "path", "line", "severity", "body")
             must remain in English. Only the human-readable text values change language.
           SYSPROMPT
-          sed -i "s|\$REVIEW_LANG|${{ inputs.language }}|g" system_prompt.txt
+          LANG="${{ inputs.language }}"
+          sed -i "s|\$REVIEW_LANG|$LANG|g" system_prompt.txt
+
+          if [ "$LANG" = "Russian" ]; then
+            sed -i "s|\$HEADING_INTENT|Цель|g"                  system_prompt.txt
+            sed -i "s|\$HEADING_RISK|Оценка рисков|g"           system_prompt.txt
+            sed -i "s|\$HEADING_FINDINGS|Ключевые замечания|g"  system_prompt.txt
+            sed -i "s|\$HEADING_VERDICT|Вердикт|g"              system_prompt.txt
+            sed -i "s|\$SEVERITY_CRITICAL|Критично|g"          system_prompt.txt
+            sed -i "s|\$SEVERITY_WARNING|Внимание|g"      system_prompt.txt
+            sed -i "s|\$SEVERITY_SUGGESTION|Предложение|g"      system_prompt.txt
+            sed -i "s|\$SEVERITY_NITPICK|Замечание|g"              system_prompt.txt
+            sed -i "s|\$LABEL_PROBLEM|ПРОБЛЕМА|g"               system_prompt.txt
+            sed -i "s|\$LABEL_IMPACT|ПОСЛЕДСТВИЯ|g"             system_prompt.txt
+            sed -i "s|\$LABEL_FIX|ИСПРАВЛЕНИЕ|g"                system_prompt.txt
+          else
+            sed -i "s|\$HEADING_INTENT|Intent|g"                system_prompt.txt
+            sed -i "s|\$HEADING_RISK|Risk assessment|g"         system_prompt.txt
+            sed -i "s|\$HEADING_FINDINGS|Key findings|g"        system_prompt.txt
+            sed -i "s|\$HEADING_VERDICT|Verdict|g"              system_prompt.txt
+            sed -i "s|\$SEVERITY_CRITICAL|Critical|g"           system_prompt.txt
+            sed -i "s|\$SEVERITY_WARNING|Warning|g"             system_prompt.txt
+            sed -i "s|\$SEVERITY_SUGGESTION|Suggestion|g"       system_prompt.txt
+            sed -i "s|\$SEVERITY_NITPICK|Nitpick|g"             system_prompt.txt
+            sed -i "s|\$LABEL_PROBLEM|PROBLEM|g"                system_prompt.txt
+            sed -i "s|\$LABEL_IMPACT|IMPACT|g"                  system_prompt.txt
+            sed -i "s|\$LABEL_FIX|FIX|g"                        system_prompt.txt
+          fi
 
           cat > user_prompt.txt << EOF
           PR Title: ${{ steps.pr.outputs.title }}
@@ -265,6 +303,7 @@ jobs:
             # Convert AI's file line numbers to diff positions using position_map.json
             # The GitHub Reviews API reliably resolves "position" but not "line"/"side"
             jq --arg sha "${{ steps.pr.outputs.head_sha }}" \
+               --arg lang "${{ inputs.language }}" \
                --slurpfile pmap position_map.json \
             '{
               body: .summary,
@@ -274,11 +313,19 @@ jobs:
                 .inline_comments[] |
                 . as $c |
                 ($c.path + ":" + ($c.line | tostring)) as $key |
-                (if   $c.severity == "critical" then "🚨 **Critical**: "
-                 elif $c.severity == "warning"  then "⚠️ **Warning**: "
-                 elif $c.severity == "suggestion" then "🚀 **Suggestion**: "
-                 elif $c.severity == "nitpick"  then "✨ **Nitpick**: "
-                 else "" end) as $badge |
+                (if $lang == "Russian" then
+                  if   $c.severity == "critical"   then "🚨 **Критично**: "
+                  elif $c.severity == "warning"    then "⚠️ **Внимание**: "
+                  elif $c.severity == "suggestion" then "🚀 **Предложение**: "
+                  elif $c.severity == "nitpick"    then "✨ **Мелочь**: "
+                  else "" end
+                else
+                  if   $c.severity == "critical"   then "🚨 **Critical**: "
+                  elif $c.severity == "warning"    then "⚠️ **Warning**: "
+                  elif $c.severity == "suggestion" then "🚀 **Suggestion**: "
+                  elif $c.severity == "nitpick"    then "✨ **Nitpick**: "
+                  else "" end
+                end) as $badge |
                 if $pmap[0][$key] then
                   { path: $c.path, position: $pmap[0][$key], body: ($badge + $c.body) }
                 else
